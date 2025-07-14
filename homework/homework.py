@@ -92,17 +92,20 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
-import os
-import gzip
-import json
-import pickle
+
+# flake8: noqa: E501
+
 import pandas as pd
+import os
+import json
+import joblib
+import gzip
+import zipfile
 
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.metrics import (
     precision_score,
     recall_score,
@@ -112,107 +115,90 @@ from sklearn.metrics import (
 )
 
 
-def read_compressed_csv(path: str) -> pd.DataFrame:
-    return pd.read_csv(path, compression="zip")
-
-
-def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+def load_and_clean_data(path_zip, temp_dir="/mnt/data/temp") -> pd.DataFrame:
+    with zipfile.ZipFile(path_zip, 'r') as zip_ref:
+        zip_ref.extractall(temp_dir)
+    csv_file = os.listdir(temp_dir)[0]
+    df = pd.read_csv(os.path.join(temp_dir, csv_file))
     df = df.rename(columns={"default payment next month": "default"})
-    df = df.drop(columns=["ID"])
-    df = df[df["EDUCATION"] != 0]
-    df = df[df["MARRIAGE"] != 0]
-    df["EDUCATION"] = df["EDUCATION"].apply(lambda val: val if val <= 4 else 4)
-    return df
+    df = df.drop(columns=["ID"], errors="ignore")
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: 4 if x > 4 else x)
+    return df.dropna()
 
 
-def assemble_pipeline() -> Pipeline:
-    categorical = ["SEX", "EDUCATION", "MARRIAGE"]
-    encoder = OneHotEncoder(handle_unknown="ignore")
-    transformer = ColumnTransformer(
-        transformers=[("cat", encoder, categorical)],
+def build_pipeline() -> Pipeline:
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    preprocessor = ColumnTransformer(
+        transformers=[("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features)],
         remainder="passthrough"
     )
-    classifier = RandomForestClassifier(random_state=42)
-    return Pipeline([("transform", transformer), ("model", classifier)])
+    return Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", RandomForestClassifier(
+            n_estimators=100,
+            max_depth=10,
+            min_samples_split=2,
+            random_state=42
+        ))
+    ])
 
 
-def configure_gridsearch(pipe: Pipeline) -> GridSearchCV:
-    search_space = {
-        "model__n_estimators": [50, 100, 200],
-        "model__max_depth": [None, 5, 10, 20],
-        "model__min_samples_split": [2, 5, 10],
-        "model__min_samples_leaf": [1, 2, 4],
-    }
-    return GridSearchCV(
-        estimator=pipe,
-        param_grid=search_space,
-        cv=10,
-        scoring="balanced_accuracy",
-        refit=True,
-        n_jobs=-1,
-        verbose=2
-    )
-
-
-def export_model(model, destination: str):
-    os.makedirs(os.path.dirname(destination), exist_ok=True)
-    with gzip.open(destination, "wb") as stream:
-        pickle.dump(model, stream)
-
-
-def compute_metrics(label: str, y_true, y_pred) -> dict:
+def get_metrics(y_true, y_pred, dataset_name: str) -> dict:
     return {
-        "type": "metrics",
-        "dataset": label,
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+        'dataset': dataset_name,
+        'precision': precision_score(y_true, y_pred),
+        'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+        'recall': recall_score(y_true, y_pred),
+        'f1_score': f1_score(y_true, y_pred),
     }
 
 
-def compute_confusion(label: str, y_true, y_pred) -> dict:
-    cm = confusion_matrix(y_true, y_pred)
+def get_confusion_dict(y_true, y_pred, dataset_name: str) -> dict:
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     return {
-        "type": "cm_matrix",
-        "dataset": label,
-        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
-        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+        'type': 'cm_matrix',
+        'dataset': dataset_name,
+        'true_0': {'predicted_0': int(cm[0, 0]), 'predicted_1': int(cm[0, 1])},
+        'true_1': {'predicted_0': int(cm[1, 0]), 'predicted_1': int(cm[1, 1])},
     }
 
 
-def run_pipeline():
-    input_dir = "files/input"
-    model_dir = "files/models"
-    output_dir = "files/output"
+def main():
+    # === Paso 1 y 2 ===
+    train_df = load_and_clean_data("files/input/train_data.csv.zip")
+    test_df = load_and_clean_data("files/input/test_data.csv.zip")
 
-    train_df = preprocess(read_compressed_csv(os.path.join(input_dir, "train_data.csv.zip")))
-    test_df = preprocess(read_compressed_csv(os.path.join(input_dir, "test_data.csv.zip")))
+    X_train = train_df.drop(columns=["default"])
+    y_train = train_df["default"]
+    X_test = test_df.drop(columns=["default"])
+    y_test = test_df["default"]
 
-    X_train, y_train = train_df.drop("default", axis=1), train_df["default"]
-    X_test, y_test = test_df.drop("default", axis=1), test_df["default"]
+    # === Paso 3 y 4 ===
+    pipeline = build_pipeline()
+    pipeline.fit(X_train, y_train)
 
-    pipe = assemble_pipeline()
-    search = configure_gridsearch(pipe)
-    search.fit(X_train, y_train)
+    # === Paso 5 ===
+    os.makedirs("files/models", exist_ok=True)
+    with gzip.open("files/models/model.pkl.gz", "wb") as f:
+        joblib.dump(pipeline, f)
 
-    export_model(search, os.path.join(model_dir, "model.pkl.gz"))
+    # === Paso 6 ===
+    y_train_pred = pipeline.predict(X_train)
+    y_test_pred = pipeline.predict(X_test)
 
-    predictions_train = search.predict(X_train)
-    predictions_test = search.predict(X_test)
+    train_metrics = get_metrics(y_train, y_train_pred, "train")
+    test_metrics = get_metrics(y_test, y_test_pred, "test")
 
-    results = [
-        compute_metrics("train", y_train, predictions_train),
-        compute_metrics("test", y_test, predictions_test),
-        compute_confusion("train", y_train, predictions_train),
-        compute_confusion("test", y_test, predictions_test),
-    ]
+    # === Paso 7 ===
+    train_cm = get_confusion_dict(y_train, y_train_pred, "train")
+    test_cm = get_confusion_dict(y_test, y_test_pred, "test")
 
-    os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, "metrics.json"), "w") as file:
-        for row in results:
-            file.write(json.dumps(row) + "\n")
+    # === Guardar métricas ===
+    os.makedirs("files/output", exist_ok=True)
+    all_metrics = [train_metrics, test_metrics, train_cm, test_cm]
+    with open("files/output/metrics.json", "w") as f:
+        json.dump(all_metrics, f, indent=2)
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    main()
